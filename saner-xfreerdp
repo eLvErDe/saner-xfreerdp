@@ -1,0 +1,161 @@
+#!/bin/bash
+
+
+# Sanity checks
+if [ -z `which xdotool` ]; then
+  echo "Please apt-get install xdotool"
+  exit 2
+fi
+if [ -z `which xwininfo` ]; then
+  echo "Please apt-get install x11-utils"
+  exit 2
+fi
+if [ -z `which xrandr` ]; then
+  echo "Please apt-get install x11-xserver-utils"
+  exit 2
+fi
+if [ -z `which xfreerdp` ]; then
+  echo "Please apt-get install freerdp2-x11"
+  exit 2
+fi
+
+
+# Doc
+usage() {
+  echo
+  echo "Usage ${0} [-h] [-d <domain>] [-u <username>] [-p <password>] [-f] -a <address>"
+  echo
+  echo "-h for help, -f for fullscreen mode"
+  echo
+  echo "The following options default may by set in \"${HOME}/.saner-xfreerdp\":"
+  echo "  DOMAIN=\"domain\""
+  echo "  USERNAME=\"username\""
+  echo "  PASSWORD=\"password\" (probably not a good idea to store password here)"
+  echo "  KEYMAP=\"keymap name\" (check available with xfreerdp /kbd-list, otherwise will be detected by the script)"
+  echo "  DO_RESIZE=0 (do not automatically resize screen to 90% of current active display)"
+  echo "  RESIZE_PERCENT=70 (resize screen to nn% instead of 90% of current active display)"
+  echo "  ADD_OPTS="+clipboard +home-drive" (additional xfreerdp arguments, defaults enable clipboard and home disk sharing)"
+  echo
+  echo "You need to logout from the remote session to get keymap updated"
+  exit 2
+}
+
+
+ADD_OPTS="+clipboard +home-drive"
+FULLSCREEN=0
+DO_RESIZE=1
+RESIZE_PERCENT=90
+# Source config file
+test -f "${HOME}/.saner-xfreerdp" && source "${HOME}/.saner-xfreerdp"
+
+# Handle arguments
+OPTIND=1 # Start getops over
+
+while getopts "h?d:u:p:a:f" opt; do
+  case "$opt" in
+  h|\?) usage ;;
+  d) DOMAIN="${OPTARG}" ;;
+  u) USERNAME="${OPTARG}" ;;
+  p) PASSWORD="${OPTARG}" ;;
+  a) ADDRESS="${OPTARG}" ;;
+  f) FULLSCREEN=1 ;;
+  esac
+done
+
+shift $((OPTIND-1))
+
+CMDLINE="xfreerdp ${ADD_OPTS}"
+test -n "${DOMAIN}"   && CMDLINE="${CMDLINE} /d:\"${DOMAIN}\""
+test -n "${USERNAME}" && CMDLINE="${CMDLINE} /u:\"${USERNAME}\""
+test -n "${PASSWORD}" && CMDLINE="${CMDLINE} /p:\"${PASSWORD}\""
+test -n "${ADDRESS}"  && CMDLINE="${CMDLINE} /v:\"${ADDRESS}\""
+test -z "${ADDRESS}"  && usage
+[ "${FULLSCREEN}" -eq 1 ] && CMDLINE="${CMDLINE} /f"
+
+# Try to get the right Windows keymap
+XKBLAYOUT1=`setxkbmap -query | grep '^layout:' | cut -d':' -f2 | cut -d',' -f1 | tr -d '[:space:]'`
+XKBVARIANT1=`setxkbmap -query | grep '^variant:' | cut -d':' -f2 | cut -d',' -f1 | tr -d '[:space:]'`
+
+case "${XKBLAYOUT1}" in
+  fr)
+    KEYMAP="French"
+    ;;
+  de)
+    KEYMAP="German"
+    ;;
+  us)
+    KEYMAP="US"
+    ;;
+  ch)
+    case "${XKBVARIANT1}" in
+      fr)
+        KEYMAP="Swiss French"
+      ;;
+      de)
+        KEYMAP="Swiss German"
+      ;;
+    esac
+    ;;
+esac
+
+if [ -z "${KEYMAP}" ]; then
+  echo "WARNING: Windows keymap could not be detected, either override it by setting KEYMAP=\"Some Thing\" (Check available with xfreerdp /kbd-list) in \"${HOME}/.saner-xfreerdp\" or even better, edit this script to improve the case statement detecting keymap and send the patch to acecile@le-vert.net"
+else
+  CMDLINE="${CMDLINE} /kbd:\"${KEYMAP}\""
+fi
+
+
+# Compute 90% of current display
+# Insopired by:
+# http://superuser.com/questions/603528/how-to-get-the-current-monitor-resolution-or-monitor-name-lvds-vga1-etc
+
+OFFSET_RE="\+?(-?[0-9]+)\+?(-?[0-9]+)"
+IS_NUMBER_RE='^[0-9]+$'
+
+# Get the window position
+pos=($(xwininfo -id $(xdotool getactivewindow) | 
+  sed -nr "s/^.*geometry .*${OFFSET_RE}.*$/\1 \2/p"))
+
+# Loop through each screen and compare the offset with the window
+# coordinates.
+while read name width height xoff yoff
+do
+  # Can fail parsing some time (connected but bot defined, no width, no height)
+  if [[ ! "${width}" =~ ${IS_NUMBER_RE} ]]; then
+    continue
+  fi
+  if [ "${pos[0]}" -ge "${xoff}" \
+    -a "${pos[1]}" -ge "${yoff}" \
+    -a "${pos[0]}" -lt "$((${xoff}+${width}))" \
+    -a "${pos[1]}" -lt "$((${yoff}+${height}))" ]
+  then
+    monitor=${name}
+  fi
+done < <(xrandr | grep -w connected |
+  sed -r "s/^([^ ]*).*\b([-0-9]+)x([-0-9]+)${OFFSET_RE}.*$/\1 \2 \3 \4 \5/" |
+  sort -nk4,5)
+
+# If we found a monitor, extract its resolution
+if [ ! -z "${monitor}" ]; then
+  resolution=`xrandr --query | grep "^${monitor} connected" |
+  sed -r "s/^([^ ]*).*\b([-0-9]+)x([-0-9]+)${OFFSET_RE}.*$/\1 \2 \3 \4 \5/"`
+  width=`echo ${resolution} | awk '{ print $2 }'`
+  height=`echo ${resolution} | awk '{ print $3 }'`
+  echo "INFO: Detected active screen on monitor ${monitor} with width=${width} and height=${height}"
+
+  # Resize to 95%
+  if [ ${DO_RESIZE} -eq 1 -a ${FULLSCREEN} -eq 0 ]; then
+    width=$((${width}*${RESIZE_PERCENT}/100))
+    height=$((${height}*${RESIZE_PERCENT}/100))
+    echo "INFO: Will use resized resolution of ${width}x${height}"
+    CMDLINE="${CMDLINE} /w:${width} /h:${height}"
+  fi
+
+
+fi
+
+
+echo
+echo "INFO: Running ${CMDLINE}"
+echo
+eval ${CMDLINE}
